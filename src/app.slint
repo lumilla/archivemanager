@@ -1,0 +1,41 @@
+import { Button, VerticalBox, LineEdit } from "std-widgets.slint";
+export component AppWindow inherits Window {
+    // Define the window properties
+    width: 600px;
+    height: 400px;
+    title: "Archive Manager";
+
+    // functions back to the Rust ("callbacks")
+    callback create_archive(string);
+    callback open_archive(string);
+
+    // Reactive properties for updating the UI state from Rust
+    in-out property <string> status-text: "Welcome!";
+    in-out property <bool> is-error: false;
+
+    VerticalBox {
+        Text {
+            text: status-text;
+            color: is-error ? red : green;
+            horizontal-alignment: center;
+        }
+
+        Button {
+            text: "Create Archive";
+            clicked => {
+                create_archive(archiveName.text);
+            }
+        }
+
+        Button {
+            text: "Open Archive";
+            clicked => {
+                open_archive(archiveName.text);
+            }
+        }
+
+        archiveName := LineEdit { // This sets a variable "archiveName" to refer to the contents of lineEdit, (a text input with a weird name)
+                placeholder-text: "Enter archive name...";
+        }
+    }
+}
