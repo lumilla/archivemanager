@@ -289,6 +289,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "eframe",
+ "egui_infinite_scroll",
  "env_logger",
  "log",
  "migration",
@@ -1094,6 +1095,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "concat-idents"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f76990911f2267d837d9d0ad060aa63aaad170af40904b29461734c339030d4d"
+dependencies = [
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1540,6 +1551,38 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "winit",
+]
+
+[[package]]
+name = "egui_inbox"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2060b5648598bd7fb8b2e5826095fd93bdf4393d853fb6ed9d1108f720407ecb"
+dependencies = [
+ "egui",
+ "parking_lot",
+]
+
+[[package]]
+name = "egui_infinite_scroll"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d16c287a76c05cb697299ccd111550a1b8a24278f91874f72460b271af4f8fb2"
+dependencies = [
+ "egui",
+ "egui_inbox",
+ "egui_virtual_list",
+ "hello_egui_utils",
+]
+
+[[package]]
+name = "egui_virtual_list"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c535bf4fb8bec34daa1a1c18d4233ab9a61a6b8f092f1d37278909c49fda5dd"
+dependencies = [
+ "egui",
+ "web-time",
 ]
 
 [[package]]
@@ -2190,6 +2233,16 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hello_egui_utils"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c34bfd8bff6f6df43b0b73ed7949a7aff0c98c2c1bd4c2f2771f5f2f6d98ced0"
+dependencies = [
+ "concat-idents",
+ "egui",
+]
 
 [[package]]
 name = "hermit-abi"
