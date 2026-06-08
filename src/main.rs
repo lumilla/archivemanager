@@ -382,6 +382,7 @@ impl ArchiveManagerApp {
                             .hint_text("Search by title...")
                             .desired_width(220.0),
                     );
+                    response.request_focus(); // this saves a click to focus the search box
                     if response.changed() {
                         search_changed = true;
                     }
