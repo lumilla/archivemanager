@@ -1,8 +1,10 @@
 mod entities;
+mod error_propagator;
 
 use eframe::egui;
 use egui_infinite_scroll::InfiniteScroll;
 use entities::artifacts;
+use error_propagator::ErrorPropagator;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Database, DbConn, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect,
@@ -176,9 +178,8 @@ struct ArchiveManagerApp {
     search_query: String,
     archive_just_opened: bool, // true for one frame on entry, used to resize and retitle
 
-    // Error dialog, shown in all screens
-    show_error: bool,
-    error_message: String,
+    // Error propagator for displaying errors in the UI
+    error_propagator: ErrorPropagator,
 
     // Channel for passing results from async tasks back to the UI.
     // The sender is cloned into each spawned task; the receiver is polled every frame.
@@ -207,8 +208,7 @@ impl ArchiveManagerApp {
             search_open: false,
             search_query: String::new(),
             archive_just_opened: false,
-            show_error: false,
-            error_message: String::new(),
+            error_propagator: ErrorPropagator::new(),
             tx,
             rx,
             rt,
@@ -265,6 +265,17 @@ impl ArchiveManagerApp {
         }
 
         ui.add_space(4.0);
+
+        // commented out but kept for easy testing of the error thing
+        /*
+        // test: create error test button
+        if ui.button("Test Error").clicked() {
+            self.error_propagator.push(
+                "Test Error",
+                Some("This is a test error message.".to_string()),
+            );
+        }
+        */
 
         // Copy before the closure to avoid borrow issues with self inside it.
         let archive_exists = self.archive_exists;
@@ -424,8 +435,7 @@ impl eframe::App for ArchiveManagerApp {
                     self.archive_just_opened = true;
                 }
                 DbMessage::Error(e) => {
-                    self.error_message = e;
-                    self.show_error = true;
+                    self.error_propagator.push(e, None);
                 }
             }
         }
@@ -436,26 +446,8 @@ impl eframe::App for ArchiveManagerApp {
             self.show_archive(ui, &ctx);
         }
 
-        // Error dialog shown in all screens.
-        if self.show_error {
-            let error_message = self.error_message.clone();
-            let mut open = true;
-            egui::Window::new("Error")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .default_pos(ctx.content_rect().center() - egui::vec2(120.0, 40.0))
-                .show(&ctx, |ui| {
-                    ui.label(&error_message);
-                    ui.add_space(8.0);
-                    if ui.button("Close").clicked() {
-                        self.show_error = false;
-                    }
-                });
-            if !open {
-                self.show_error = false;
-            }
-        }
+        // Display any errors that occurred.
+        self.error_propagator.show(&ctx)
     }
 }
 
@@ -476,7 +468,14 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "Archive Manager",
         native_options,
-        Box::new(|_cc| Ok(Box::new(ArchiveManagerApp::new()))),
+        Box::new(|cc| {
+            let mut fonts = egui::FontDefinitions::default();
+            egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+            // Should patch egui phoshpor to have other variants I guess, but haven't gotten around to it.
+            cc.egui_ctx.set_fonts(fonts);
+
+            Ok(Box::new(ArchiveManagerApp::new()))
+        }),
     )?;
 
     Ok(()) // Lesson learned: whatever a function returns it does not have a semicolon for some reason.
