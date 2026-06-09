@@ -10,7 +10,7 @@ use sea_orm::{
     QueryOrder, QuerySelect,
 };
 use sea_orm_migration::prelude::*;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 
 const PAGE_SIZE: usize = 25;
 
@@ -110,10 +110,10 @@ async fn seed_demo_data(db: &DbConn) -> anyhow::Result<()> {
     Ok(())
 }
 
-// Fetch PAGE_SIZE artifacts starting at offset, optionally filtered by title.
+// Fetch PAGE_SIZE artifacts starting at cursor, optionally filtered by title.
 async fn fetch_artifacts(
     db: &DbConn,
-    offset: usize,
+    last_id: Option<i64>,
     query: &str,
 ) -> Result<Vec<ArtifactRow>, sea_orm::DbErr> {
     let mut select = artifacts::Entity::find().order_by_asc(artifacts::Column::Id);
@@ -122,11 +122,11 @@ async fn fetch_artifacts(
         select = select.filter(artifacts::Column::Title.contains(query));
     }
 
-    let rows = select
-        .offset(offset as u64)
-        .limit(PAGE_SIZE as u64)
-        .all(db)
-        .await?;
+    if let Some(id) = last_id {
+        select = select.filter(artifacts::Column::Id.gt(id));
+    }
+
+    let rows = select.limit(PAGE_SIZE as u64).all(db).await?;
 
     Ok(rows
         .into_iter()
@@ -144,24 +144,32 @@ fn make_scroll(
     db: DbConn,
     rt_handle: tokio::runtime::Handle,
     query: String,
-) -> InfiniteScroll<ArtifactRow, usize> {
+    active_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+) -> InfiniteScroll<ArtifactRow, i64> {
     InfiniteScroll::new().end_loader(move |cursor, callback| {
         let db = db.clone();
         let query = query.clone();
-        let offset = cursor.unwrap_or(0);
-        rt_handle.spawn(async move {
-            match fetch_artifacts(&db, offset, &query).await {
+        let active_task = active_task.clone();
+
+        let handle = rt_handle.spawn(async move {
+            match fetch_artifacts(&db, cursor, &query).await {
                 Ok(items) => {
                     let next = if items.len() < PAGE_SIZE {
                         None
                     } else {
-                        Some(offset + PAGE_SIZE)
+                        items.last().map(|item| item.id)
                     };
                     callback(Ok((items, next)));
                 }
                 Err(e) => callback(Err(e.to_string())),
             }
         });
+
+        // Instantly abort the old background query task if it's still dragging along
+        let mut guard = active_task.lock().unwrap();
+        if let Some(old_task) = guard.replace(handle) {
+            old_task.abort();
+        }
     })
 }
 
@@ -173,10 +181,13 @@ struct ArchiveManagerApp {
 
     // Archive view state. None until an archive is opened.
     db: Option<DbConn>,
-    scroll: Option<InfiniteScroll<ArtifactRow, usize>>,
+    scroll: Option<InfiniteScroll<ArtifactRow, i64>>,
     search_open: bool,
     search_query: String,
     archive_just_opened: bool, // true for one frame on entry, used to resize and retitle
+
+    // Track the currently executing database search task (if any) smoothly via Arc
+    active_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 
     // Error propagator for displaying errors in the UI
     error_propagator: ErrorPropagator,
@@ -208,6 +219,7 @@ impl ArchiveManagerApp {
             search_open: false,
             search_query: String::new(),
             archive_just_opened: false,
+            active_task: Arc::new(Mutex::new(None)),
             error_propagator: ErrorPropagator::new(),
             tx,
             rx,
@@ -371,10 +383,10 @@ impl ArchiveManagerApp {
                 });
             });
         }
-
         // Search window, opened with Ctrl+F.
-        // FIXME: Known issue: WILDLY inefficient, rebuilds the entire freaking scroll list every time
-        // (So, I should really optimize this, but it works for now!)
+        // Now more efficient than it was, still not ideal
+        // FIXME: Known issue: The UI will blink when the search query changes,
+        // I found fixing this exceedingly difficult, and gave up.
         if self.search_open {
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.search_open = false;
@@ -401,15 +413,17 @@ impl ArchiveManagerApp {
             if !open {
                 self.search_open = false;
             }
-            // Rebuild the scroll outside the closure once we know the query changed.
-            if search_changed {
-                if let Some(db) = &self.db {
-                    self.scroll = Some(make_scroll(
-                        db.clone(),
-                        self.rt.handle().clone(),
-                        self.search_query.clone(), // cloning this is fine?
-                    ));
+            // Instantly updates on text input, drops background task
+            if search_changed && let Some(db) = &self.db {
+                if let Some(old_task) = self.active_task.lock().unwrap().take() {
+                    old_task.abort();
                 }
+                self.scroll = Some(make_scroll(
+                    db.clone(),
+                    self.rt.handle().clone(),
+                    self.search_query.clone(), // cloning this is fine?
+                    self.active_task.clone(),
+                ));
             }
         }
     }
@@ -430,6 +444,7 @@ impl eframe::App for ArchiveManagerApp {
                         // of use cases to just clone stuff. Thanks for coming to my TED talk!
                         self.rt.handle().clone(),
                         String::new(),
+                        self.active_task.clone(),
                     ));
                     self.db = Some(db);
                     self.archive_just_opened = true;
@@ -481,3 +496,27 @@ fn main() -> anyhow::Result<()> {
     Ok(()) // Lesson learned: whatever a function returns it does not have a semicolon for some reason.
     // I do not like it.
 }
+
+/* You may ask: "Why build a custom schema? Why not use CIDOC CRM?"
+
+The short answer is that in my opinion, CIDOC is a monolithic, over-engineered nightmare
+that serves ISO committees better than it serves actual local museum curators.
+
+I spent TOO much time trying to implement the CIDOC ontology. It is
+essentially an academic fever dream that effectively demands a semantic graph database architecture.
+Right, I attempted to use SurrealDB to handle the graph relationships,
+this not only made the compile times gigantic, also was a massive pain in the ass in all the ways
+barely worked, easily tripled the lines of code here.
+Doing even simple things with CIDOC required dozens of lines of boilerplate.
+Though yes, CIDOC is theoretically "correct" for interoperability in massive, multi-national
+institutional databases. For this app, it is a parasitic, soul-crushing weight and I have a
+love-hate relationship with it. I theoretically would want this app to use CIDOC for
+interoperability (read: international standards are cool)
+HOWEVER, I do NOT want to maintain that, and I could not even write it. Hell, I tried AI tools and
+even those completely and utterly failed at even really initializing a CIDOC schema.
+Thus I have opted for a (completely arbitrary), flat, sane, relational schema that I can actually maintain.
+If the museum ever needs to export to CIDOC standards in the future, we can
+write an adapter layer then. Or something like that, anyway. But for now? Screw that. I am prioritizing
+functionality and a codebase that doesn't make me want to walk into the sea.
+(Also wikidata model would be cool, also kind of a graph DB though. And I am NOT touching that)
+*/

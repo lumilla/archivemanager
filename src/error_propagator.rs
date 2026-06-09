@@ -65,8 +65,8 @@ impl ErrorPropagator {
 
                     ui.label(&error.message);
 
-                    if let Some(details) = &error.details {
-                        if !details.is_empty() {
+                    if let Some(details) = &error.details
+                        && !details.is_empty() {
                             egui::CollapsingHeader::new("Details")
                                 .default_open(false)
                                 .show(ui, |ui| {
@@ -78,7 +78,6 @@ impl ErrorPropagator {
                                         });
                                 });
                         }
-                    }
 
                     ui.add_space(8.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
