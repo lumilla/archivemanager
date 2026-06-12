@@ -2,3 +2,4 @@
 *.db
 *.db-journal
 cidoc_crm_version_*.pdf
+.env

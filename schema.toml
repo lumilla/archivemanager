@@ -1,0 +1,27 @@
+[[features]]
+id = "title"
+label = "Title"
+required = true
+system_title = true
+[features.ui_type]
+type = "Text"
+
+[[features]]
+id = "dimensions"
+label = "Dimensions"
+required = false
+[features.ui_type]
+type = "Unit"
+name = "Length"
+options = ["cm", "m", "mm", "inch"]
+
+[[features]]
+id = "material"
+label = "Material"
+required = false
+[features.ui_type]
+type = "Dropdown"
+options = ["Stone", "Wood", "Metal", "Ceramic", "Glass", "Fabric"]
+[features.relation]
+rel_type = "HAS_MATERIAL"
+target_label = "Material"

@@ -1,248 +1,159 @@
+mod db;
 mod entities;
 mod error_propagator;
 
+use db::{ArchiveDb, ArchiveStatus};
+
 use eframe::egui::{self};
 use egui_infinite_scroll::InfiniteScroll;
-use entities::artifacts;
+use entities::artifacts::{self, DynamicModel, Schema};
 use error_propagator::ErrorPropagator;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Database, DbConn, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect,
-};
-use sea_orm_migration::prelude::*;
 use std::sync::{Arc, Mutex, mpsc};
 
 const PAGE_SIZE: usize = 25;
 
-// One row as fetched from the DB, kept small since it gets cloned a lot by the scroll list.
+// Domain row type
+
+// One artifact row as shown in the scroll list.  Kept small since it is
+// cloned frequently by the infinite-scroll widget.
 #[derive(Debug, Clone)]
 struct ArtifactRow {
-    id: i64,
-    title: String,
-    dimensions: Option<String>,
+    model: DynamicModel,
     selected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum DetailEditField {
-    Title,
-    Dimensions,
+struct DetailEditField {
+    id: String,
 }
 
-// Message passed from an async database task back to the UI.
+// Async to UI message bus
+
 enum DbMessage {
-    Opened(DbConn),
+    // Initial connection succeeded.
+    Connected(ArchiveDb),
+    // Archive probe result.
+    ArchiveStatus(ArchiveStatus),
+    // Archive is fully ready (opened or migrated).
+    Opened,
+    // Any recoverable error to show to the user.
     Error(String),
 }
 
-// Sanitize the archive name to be a safe filename.
-// even though uppercase letters and special characters are technically allowed in filenames AFAIK
-// they are a pain in the you-know-what to work with.
-fn sanitize_name(name: &str) -> String {
-    name.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect()
-}
+// Infinite-scroll factory
 
-// Will throw an error if the database does not exist and create is false.
-async fn init_db(archive_name: &str, create: bool) -> anyhow::Result<DbConn> {
-    let db_file = format!("{}.db", sanitize_name(archive_name));
-
-    // If we are just opening, check if the file exists first to avoid eager creation.
-    if !create && !std::path::Path::new(&db_file).exists() {
-        return Err(anyhow::anyhow!(
-            "Archive '{}' does not exist.",
-            archive_name
-        ));
-    }
-
-    // SQLite connection string. RWC = Read-Write-Create, RW = Read-Write.
-    let mode = if create { "rwc" } else { "rw" };
-    let db = Database::connect(format!("sqlite://{}?mode={}", db_file, mode)).await?;
-
-    // Automatically apply database migrations.
-    migration::Migrator::up(&db, None).await?;
-    Ok(db)
-}
-
-// Seed some demo items so a freshly created archive has something to show.
-// Does nothing if the archive already has data.
-async fn seed_demo_data(db: &DbConn) -> anyhow::Result<()> {
-    if artifacts::Entity::find().count(db).await? > 0 {
-        return Ok(());
-    }
-
-    let demo: &[(&str, Option<&str>)] = &[
-        // demo data courtesy of Google Gemini.
-        ("Roman Amphora", Some("30x15cm")),
-        ("Bronze Age Sword", Some("75x8cm")),
-        ("Medieval Coin", None),
-        ("Viking Brooch", Some("5x5cm")),
-        ("Egyptian Amulet", Some("4x2cm")),
-        ("Greek Pottery Fragment", Some("12x8cm")),
-        ("Iron Age Axe Head", Some("18x10cm")),
-        ("Roman Legionary Helmet", Some("25x22cm")),
-        ("Byzantine Mosaic Tile", Some("10x10cm")),
-        ("Celtic Torc Fragment", Some("6x3cm")),
-        ("Neolithic Arrowhead", Some("4x2cm")),
-        ("Persian Silver Bowl", Some("20x8cm")),
-        ("Mayan Jade Pendant", Some("7x4cm")),
-        ("Chinese Tang Figurine", Some("15x8cm")),
-        ("Sumerian Clay Tablet", Some("12x9cm")),
-        ("Norse Rune Stone Fragment", Some("30x20cm")),
-        ("Etruscan Gold Earring", Some("3x2cm")),
-        ("Minoan Seal Stone", Some("2x2cm")),
-        ("Roman Glass Bottle", Some("12x5cm")),
-        ("Aztec Obsidian Blade", Some("8x3cm")),
-        ("Phoenician Glass Bead", Some("1x1cm")),
-        ("Mesopotamian Cylinder Seal", Some("4x2cm")),
-        ("Incan Quipu Fragment", None),
-        ("Ottoman Calligraphy Scroll", Some("45x15cm")),
-        ("Ming Dynasty Porcelain Shard", Some("5x4cm")),
-    ];
-
-    for (title, dims) in demo {
-        artifacts::ActiveModel {
-            title: sea_orm::Set(String::from(*title)),
-            dimensions: sea_orm::Set(dims.map(|s| (*s).to_owned())),
-            is_archived: sea_orm::Set(Some(0)), // I think some() is a cute thing
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-    }
-
-    log::info!("Seeded {} demo artifacts.", demo.len());
-    Ok(())
-}
-
-// Fetch PAGE_SIZE artifacts starting at cursor, optionally filtered by title.
-async fn fetch_artifacts(
-    db: &DbConn,
-    last_id: Option<i64>,
-    query: &str,
-) -> Result<Vec<ArtifactRow>, sea_orm::DbErr> {
-    let mut select = artifacts::Entity::find().order_by_asc(artifacts::Column::Id);
-
-    if !query.is_empty() {
-        select = select.filter(artifacts::Column::Title.contains(query));
-    }
-
-    if let Some(id) = last_id {
-        select = select.filter(artifacts::Column::Id.gt(id));
-    }
-
-    let rows = select.limit(PAGE_SIZE as u64).all(db).await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|m| ArtifactRow {
-            id: m.id,
-            title: m.title,
-            dimensions: m.dimensions,
-            selected: false,
-        })
-        .collect())
-}
-
-async fn update_artifact(
-    db: &DbConn,
-    id: i64,
-    title: String,
-    dimensions: Option<String>,
-) -> Result<(), sea_orm::DbErr> {
-    let artifact = artifacts::Entity::find_by_id(id).one(db).await?;
-    if let Some(artifact) = artifact {
-        let mut artifact: artifacts::ActiveModel = artifact.into();
-        artifact.title = sea_orm::Set(title);
-        artifact.dimensions = sea_orm::Set(dimensions);
-        artifact.update(db).await?;
-    }
-    Ok(())
-}
-
-// Build a fresh scroll list for the given db connection and search query.
-// Called once on archive open and again whenever the search query changes.
 fn make_scroll(
-    db: DbConn,
+    db: ArchiveDb,
     rt_handle: tokio::runtime::Handle,
-    query: String,
+    archive_name: String,
+    search_query: String,
+    schema: Arc<Schema>,
     active_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-) -> InfiniteScroll<ArtifactRow, i64> {
+) -> InfiniteScroll<ArtifactRow, usize> {
     InfiniteScroll::new().end_loader(move |cursor, callback| {
         let db = db.clone();
-        let query = query.clone();
+        let archive_name = archive_name.clone();
+        let search_query = search_query.clone();
+        let schema = schema.clone();
         let active_task = active_task.clone();
+        let skip = cursor.unwrap_or(0);
 
         let handle = rt_handle.spawn(async move {
-            match fetch_artifacts(&db, cursor, &query).await {
-                Ok(items) => {
-                    let next = if items.len() < PAGE_SIZE {
+            match db
+                .list_artifacts(&archive_name, &schema, skip, PAGE_SIZE, &search_query)
+                .await
+            {
+                Ok(models) => {
+                    let next = if models.len() < PAGE_SIZE {
                         None
                     } else {
-                        items.last().map(|item| item.id)
+                        Some(skip + models.len())
                     };
-                    callback(Ok((items, next)));
+                    let rows = models
+                        .into_iter()
+                        .map(|m| ArtifactRow {
+                            model: m,
+                            selected: false,
+                        })
+                        .collect::<Vec<_>>();
+                    callback(Ok((rows, next)));
                 }
                 Err(e) => callback(Err(e.to_string())),
             }
         });
 
-        // Instantly abort the old background query task if it's still dragging along
+        // Abort any still-running page load from a previous scroll position.
         let mut guard = active_task.lock().unwrap();
-        if let Some(old_task) = guard.replace(handle) {
-            old_task.abort();
+        if let Some(old) = guard.replace(handle) {
+            old.abort();
         }
     })
 }
 
+// Application state
+
 struct ArchiveManagerApp {
+    schema: Arc<Schema>,
+    db: Option<ArchiveDb>,
+
     // Launcher state
     archive_name: String,
-    archive_exists: bool,
     show_confirm: bool,
+    show_migration_confirm: bool,
+    migration_fields_to_remove: Vec<String>,
+    migration_fields_to_add: Vec<String>,
+    archive_open: bool,
 
-    // Archive view state. None until an archive is opened.
-    db: Option<DbConn>,
-    scroll: Option<InfiniteScroll<ArtifactRow, i64>>,
+    // Archive view state
+    scroll: Option<InfiniteScroll<ArtifactRow, usize>>,
     search_open: bool,
     search_query: String,
     archive_just_opened: bool,
 
-    // The item currently open in the detail view. None = detail window closed.
+    // Detail panel state
     detail_item: Option<ArtifactRow>,
     detail_edit_field: Option<DetailEditField>,
     detail_edit_buf: String,
+    detail_edit_unit: String,
 
+    // Async infrastructure
     active_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-
-    // Error propagator for displaying errors in the UI
     error_propagator: ErrorPropagator,
-
-    // Channel for passing results from async tasks back to the UI.
-    // The sender is cloned into each spawned task; the receiver is polled every frame.
     tx: mpsc::Sender<DbMessage>,
     rx: mpsc::Receiver<DbMessage>,
-
-    // Tokio runtime for database operations.
-    // Stored here so it stays alive for the whole app session.
     rt: tokio::runtime::Runtime,
 }
 
 impl ArchiveManagerApp {
-    fn new() -> Self {
+    fn new(schema: Schema) -> Self {
         let (tx, rx) = mpsc::channel();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("Failed to create tokio runtime");
+            .expect("Failed to create Tokio runtime");
+
+        // Kick off the initial DB connection in the background.
+        let tx_clone = tx.clone();
+        rt.spawn(async move {
+            match db::connect().await {
+                Ok(db) => {
+                    let _ = tx_clone.send(DbMessage::Connected(db));
+                }
+                Err(e) => {
+                    let _ = tx_clone.send(DbMessage::Error(e.to_string()));
+                }
+            }
+        });
 
         Self {
-            archive_name: String::new(),
-            archive_exists: false,
-            show_confirm: false,
+            schema: Arc::new(schema),
             db: None,
+            archive_name: String::new(),
+            show_confirm: false,
+            show_migration_confirm: false,
+            migration_fields_to_remove: Vec::new(),
+            migration_fields_to_add: Vec::new(),
+            archive_open: false,
             scroll: None,
             search_open: false,
             search_query: String::new(),
@@ -250,6 +161,7 @@ impl ArchiveManagerApp {
             detail_item: None,
             detail_edit_field: None,
             detail_edit_buf: String::new(),
+            detail_edit_unit: String::new(),
             active_task: Arc::new(Mutex::new(None)),
             error_propagator: ErrorPropagator::new(),
             tx,
@@ -258,112 +170,131 @@ impl ArchiveManagerApp {
         }
     }
 
-    // Spawn a background task to open or create the archive database.
-    // Sends a DbMessage back through the channel and requests a repaint when done.
-    fn run_db_op(&self, create: bool, ctx: egui::Context) {
-        let archive_name = self.archive_name.clone();
-        let tx = self.tx.clone();
-        self.rt.spawn(async move {
-            match init_db(&archive_name, create).await {
-                Ok(db) => {
-                    if create {
-                        // Populate fresh archives with some demo data so there is something to look at
-                        // TODO: Remove this (but not before real data input is possible, obviously)
-                        // Might want to keep some kind of demo mode, though (to demo for Hack Club).
-                        if let Err(e) = seed_demo_data(&db).await {
-                            log::warn!("Demo seeding failed: {}", e);
-                        }
-                    }
-                    log::info!(
-                        "{} archive '{}'",
-                        if create { "Created" } else { "Opened" },
-                        archive_name
-                    );
-                    // FIXME: I should really propagate this to the UI better.
-                    if let Err(e) = tx.send(DbMessage::Opened(db)) {
-                        log::error!("Failed to send DB message: {}", e);
-                    }
-                }
-                Err(e) => {
-                    log::error!("Database operation failed: {}", e);
-                    tx.send(DbMessage::Error(e.to_string())).ok();
-                }
-            }
-            // Wake up the event loop so the message gets processed this frame.
-            ctx.request_repaint();
-        });
-    }
+    // DB operation helpers
 
-    fn save_artifact_edit(&self, di: &ArtifactRow) {
+    // Probe the archive and send an ArchiveStatus message back.
+    fn check_archive_op(&self, ctx: &egui::Context) {
         if let Some(db) = &self.db {
             let db = db.clone();
-            let id = di.id;
-            let title = di.title.clone();
-            let dimensions = di.dimensions.clone();
+            let archive_name = self.archive_name.clone();
             let tx = self.tx.clone();
             self.rt.spawn(async move {
-                if let Err(e) = update_artifact(&db, id, title, dimensions).await {
+                match db.get_archive_status(&archive_name).await {
+                    Ok(status) => {
+                        tx.send(DbMessage::ArchiveStatus(status)).ok();
+                    }
+                    Err(e) => {
+                        tx.send(DbMessage::Error(e.to_string())).ok();
+                    }
+                }
+            });
+            ctx.request_repaint();
+        }
+    }
+
+    // Run a schema migration (add/remove fields), then signal Opened.
+    fn run_migration_op(
+        &self,
+        fields_to_add: Vec<String>,
+        fields_to_remove: Vec<String>,
+        ctx: &egui::Context,
+    ) {
+        if let Some(db) = &self.db {
+            let db = db.clone();
+            let archive_name = self.archive_name.clone();
+            let tx = self.tx.clone();
+            self.rt.spawn(async move {
+                match db
+                    .migrate(&archive_name, fields_to_add, fields_to_remove)
+                    .await
+                {
+                    Ok(()) => tx.send(DbMessage::Opened).ok(),
+                    Err(e) => tx.send(DbMessage::Error(e.to_string())).ok(),
+                };
+            });
+            ctx.request_repaint();
+        }
+    }
+
+    // Open (and optionally seed) the archive, then signal Opened.
+    fn open_archive_op(&self, seed: bool, ctx: &egui::Context) {
+        if let Some(db) = &self.db {
+            let db = db.clone();
+            let archive_name = self.archive_name.clone();
+            let schema = self.schema.clone();
+            let tx = self.tx.clone();
+            self.rt.spawn(async move {
+                if seed {
+                    // Load demo data from demo_data.toml on first open.
+                    // Swap this file for any other TOML import to pre-populate a new archive.
+                    match db
+                        .import_from_file(&archive_name, "demo_data.toml", &schema)
+                        .await
+                    {
+                        Ok(r) => log::info!("Loaded {} demo records.", r.records_affected),
+                        Err(e) => log::warn!("Demo import failed: {e}"),
+                    }
+                }
+                tx.send(DbMessage::Opened).ok();
+            });
+            ctx.request_repaint();
+        }
+    }
+
+    // Persist edits on a single artifact row back to the DB.
+    fn save_artifact_edit(&self, row: &ArtifactRow) {
+        if let Some(db) = &self.db {
+            let db = db.clone();
+            let model = row.model.clone();
+            let schema = self.schema.clone();
+            let archive_name = self.archive_name.clone();
+            let tx = self.tx.clone();
+            self.rt.spawn(async move {
+                if let Err(e) = db.update_artifact(&archive_name, &model, &schema).await {
                     let _ = tx.send(DbMessage::Error(e.to_string()));
                 }
             });
         }
     }
 
-    fn sync_artifact_to_list(&mut self, id: i64, title: String, dimensions: Option<String>) {
+    // Mirror an in-memory model update back into the scroll list so the list
+    // stays in sync without a full reload.
+    fn sync_artifact_to_list(&mut self, updated: DynamicModel) {
         if let Some(scroll) = &mut self.scroll {
-            for item in scroll.items.iter_mut() {
-                if item.id == id {
-                    item.title = title.clone();
-                    item.dimensions = dimensions.clone();
+            for row in scroll.items.iter_mut() {
+                if row.model.id == updated.id {
+                    row.model = updated.clone();
                 }
             }
         }
     }
 
+    // UI panels
+
     fn show_launcher(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(8.0);
 
-        let response = ui.add(
+        if self.db.is_none() {
+            ui.label("Connecting to Neo4j database...");
+            ui.spinner();
+            return;
+        }
+
+        ui.label("Enter Archive Label (Neo4j):");
+        ui.add(
             egui::TextEdit::singleline(&mut self.archive_name)
-                .hint_text("Archive name...")
+                .hint_text("e.g. RomanCollection")
                 .desired_width(f32::INFINITY),
         );
-        if response.changed() {
-            self.archive_exists =
-                std::path::Path::new(&format!("{}.db", sanitize_name(&self.archive_name))).exists();
-        }
-
         ui.add_space(4.0);
 
-        // commented out but kept for easy testing of the error thing
-        /*
-        // test: create error test button
-        if ui.button("Test Error").clicked() {
-            self.error_propagator.push(
-                "Test Error",
-                Some("This is a test error message.".to_string()),
-            );
-        }
-        */
-
-        // Copy before the closure to avoid borrow issues with self inside it.
-        let archive_exists = self.archive_exists;
         ui.add_enabled_ui(!self.archive_name.is_empty(), |ui| {
-            let label = if archive_exists {
-                "Open Archive"
-            } else {
-                "Create Archive"
-            };
-            if ui.button(label).clicked() {
-                if archive_exists {
-                    self.run_db_op(false, ctx.clone());
-                } else {
-                    self.show_confirm = true;
-                }
+            if ui.button("Open / Create Archive").clicked() {
+                self.check_archive_op(ctx);
             }
         });
 
-        // Confirm dialog. egui::Window is a floating panel with a title bar, draggable.
+        // Create archive confirmation dialog
         if self.show_confirm {
             let archive_name = self.archive_name.clone();
             let mut open = true;
@@ -373,12 +304,15 @@ impl ArchiveManagerApp {
                 .resizable(false)
                 .default_pos(ctx.content_rect().center() - egui::vec2(120.0, 50.0))
                 .show(ctx, |ui| {
-                    ui.label(format!("Create a new archive named '{}'?", archive_name));
+                    ui.label(format!(
+                        "Archive label '{}' not found. Create it?",
+                        archive_name
+                    ));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Yes, Create It").clicked() {
                             self.show_confirm = false;
-                            self.run_db_op(true, ctx.clone());
+                            self.open_archive_op(true, ctx);
                         }
                         if ui.button("Cancel").clicked() {
                             self.show_confirm = false;
@@ -389,6 +323,62 @@ impl ArchiveManagerApp {
                 self.show_confirm = false;
             }
         }
+
+        // Destructive migration confirmation dialog
+        if self.show_migration_confirm {
+            let mut open = true;
+            let remove_list = self.migration_fields_to_remove.join(", ");
+            let add_list = self.migration_fields_to_add.join(", ");
+            let archive_name = self.archive_name.clone();
+
+            egui::Window::new("Destructive Schema Migration?")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_pos(ctx.content_rect().center() - egui::vec2(150.0, 75.0))
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Archive '{}' has a schema mismatch with schema.toml.",
+                        archive_name
+                    ));
+                    ui.add_space(4.0);
+                    if !self.migration_fields_to_remove.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            format!(
+                                "DESTRUCTIVE: The following fields will be permanently REMOVED:\n{}",
+                                remove_list
+                            ),
+                        );
+                    }
+                    if !self.migration_fields_to_add.is_empty() {
+                        ui.label(format!("The following new fields will be added:\n{}", add_list));
+                    }
+                    ui.add_space(8.0);
+                    ui.label("Are you sure you want to run the migration and open the database?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes, Migrate & Open").clicked() {
+                            self.show_migration_confirm = false;
+                            self.run_migration_op(
+                                self.migration_fields_to_add.clone(),
+                                self.migration_fields_to_remove.clone(),
+                                ctx,
+                            );
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_migration_confirm = false;
+                            self.migration_fields_to_remove.clear();
+                            self.migration_fields_to_add.clear();
+                        }
+                    });
+                });
+            if !open {
+                self.show_migration_confirm = false;
+                self.migration_fields_to_remove.clear();
+                self.migration_fields_to_add.clear();
+            }
+        }
     }
 
     fn show_archive(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -397,7 +387,7 @@ impl ArchiveManagerApp {
             self.archive_just_opened = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(900.0, 600.0)));
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                "Archive Manager - {}",
+                "Graph Archive - {}",
                 self.archive_name
             )));
         }
@@ -415,7 +405,7 @@ impl ArchiveManagerApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 scroll.ui(ui, 5, |ui, _idx, item| {
                     ui.horizontal(|ui| {
-                        // Checkbox for selection
+                        // Selection circle
                         let desired = egui::vec2(18.0, 56.0);
                         let (rect, response) =
                             ui.allocate_exact_size(desired, egui::Sense::click());
@@ -449,9 +439,9 @@ impl ArchiveManagerApp {
                             );
                         }
 
-                        // Placeholder thumbnail.
+                        // Placeholder thumbnail
                         let thumb_size = egui::vec2(56.0, 56.0);
-                        let (rect, _) = ui.allocate_exact_size(thumb_size, egui::Sense::hover()); // I don't know what the hover does here?
+                        let (rect, _) = ui.allocate_exact_size(thumb_size, egui::Sense::hover());
                         let thumb_color = if item.selected {
                             egui::Color32::from_gray(35)
                         } else {
@@ -468,212 +458,280 @@ impl ArchiveManagerApp {
 
                         ui.add_space(8.0);
 
+                        // Row text
                         ui.vertical(|ui| {
                             ui.add_space(6.0);
-                            ui.strong(format!("#{}", item.id));
+                            ui.strong(format!("#{}", item.model.id));
 
-                            let resp = ui.label(&item.title);
+                            let title_field = self.schema.get_title_field_id();
+                            let title = item.model.get_field(&title_field);
+                            let resp = ui.label(if title.is_empty() { "Untitled" } else { &title });
                             if resp.double_clicked() {
                                 open_detail = Some(item.clone());
                             }
 
-                            if let Some(dims) = &item.dimensions {
-                                ui.small(dims);
+                            for feature in self
+                                .schema
+                                .features
+                                .iter()
+                                .filter(|f| !f.system_title.unwrap_or(false))
+                                .take(2)
+                            {
+                                let val = item.model.get_field(&feature.id);
+                                if !val.is_empty() && val != "—" {
+                                    ui.small(format!("{}: {}", feature.label, val));
+                                }
                             }
                         });
                     });
-
                     ui.separator();
                 });
             });
         }
 
-        // Apply any pending open-detail action now that the borrow is released... or something like that
+        // Apply any pending open-detail action now that the borrow on scroll
+        // has been released.
         if let Some(item) = open_detail {
             self.detail_item = Some(item);
         }
 
-        // Using a fixed ID so the title can change without egui complaining?
-        if let Some(item) = &self.detail_item.clone() {
+        // Detail window
+        let detail_item = self.detail_item.clone();
+        if let Some(item) = detail_item {
             let mut open = true;
-            egui::Window::new(format!("Item #{} — {}", item.id, item.title))
-                .id(egui::Id::new("detail_window"))
-                .open(&mut open)
-                .resizable(true)
-                .min_size([320.0, 240.0])
-                .default_size([420.0, 480.0])
-                .show(ctx, |ui| {
-                    let img_height = 160.0_f32;
-                    let img_width = ui.available_width();
-                    let (img_rect, _) = ui.allocate_exact_size(
-                        egui::vec2(img_width, img_height),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter()
-                        .rect_filled(img_rect, 6.0, egui::Color32::from_gray(40));
-                    ui.painter().text(
-                        img_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        egui_phosphor::regular::IMAGE,
-                        egui::FontId::proportional(36.0),
-                        egui::Color32::from_gray(90),
-                    );
+            egui::Window::new(format!(
+                "Graph Item #{} — {}",
+                item.model.id,
+                item.model.get_field(&self.schema.get_title_field_id())
+            ))
+            .id(egui::Id::new("detail_window"))
+            .open(&mut open)
+            .resizable(true)
+            .min_size([320.0, 240.0])
+            .default_size([420.0, 480.0])
+            .show(ctx, |ui| {
+                let img_height = 160.0_f32;
+                let img_width = ui.available_width();
+                let (img_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(img_width, img_height), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(img_rect, 6.0, egui::Color32::from_gray(40));
+                ui.painter().text(
+                    img_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    egui_phosphor::regular::IMAGE,
+                    egui::FontId::proportional(36.0),
+                    egui::Color32::from_gray(90),
+                );
 
-                    ui.add_space(8.0); // Completely arbitrary.
+                ui.add_space(8.0);
 
-                    egui::Grid::new("detail_grid")
-                        .num_columns(3)
-                        .spacing([8.0, 6.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong("ID");
-                            ui.label(item.id.to_string());
-                            ui.label("");
-                            ui.end_row();
+                egui::Grid::new("detail_grid")
+                    .num_columns(3)
+                    .spacing([8.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Neo4j ID");
+                        ui.label(item.model.id.to_string());
+                        ui.label("");
+                        ui.end_row();
 
-                            ui.strong("Title");
-                            let editing_title =
-                                self.detail_edit_field == Some(DetailEditField::Title);
-                            if editing_title {
+                        let mut new_edit_field = None;
+                        let mut next_edit_buf = String::new();
+                        let mut next_edit_unit = String::new();
+                        let features = self.schema.features.clone();
+                        for feature in &features {
+                            ui.strong(&feature.label);
+                            let is_editing = self
+                                .detail_edit_field
+                                .as_ref()
+                                .is_some_and(|f| f.id == feature.id);
+
+                            if is_editing {
                                 let mut commit_item = None;
-                                if let Some(ref mut di) = self.detail_item {
-                                    let resp = ui.add(
-                                        egui::TextEdit::singleline(&mut self.detail_edit_buf)
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                    resp.request_focus();
-                                    let commit = resp.lost_focus()
-                                        || ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                    if commit {
-                                        di.title = self.detail_edit_buf.clone();
-                                        commit_item = Some(di.clone());
-                                        self.detail_edit_field = None;
-                                    }
-                                }
-                                if let Some(item) = commit_item {
-                                    self.save_artifact_edit(&item);
-                                    self.sync_artifact_to_list(
-                                        item.id,
-                                        item.title,
-                                        item.dimensions,
-                                    );
-                                }
-                            } else {
-                                ui.label(&item.title);
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new(egui_phosphor::regular::PEN)
-                                                .size(14.0),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    self.detail_edit_buf = item.title.clone();
-                                    self.detail_edit_field = Some(DetailEditField::Title);
-                                }
-                            }
-                            ui.end_row();
+                                let mut di = item.clone();
+                                let mut commit = false;
 
-                            ui.strong("Dimensions");
-                            let editing_dims =
-                                self.detail_edit_field == Some(DetailEditField::Dimensions);
-                            if editing_dims {
-                                let mut commit_item = None;
-                                if let Some(ref mut di) = self.detail_item {
-                                    let resp = ui.add(
-                                        egui::TextEdit::singleline(&mut self.detail_edit_buf)
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                    resp.request_focus();
-                                    let commit = resp.lost_focus()
-                                        || ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                    if commit {
-                                        di.dimensions = if self.detail_edit_buf.is_empty() {
-                                            None
+                                match &feature.ui_type {
+                                    artifacts::UiTypeDef::Dropdown { options } => {
+                                        let selected_text = if self.detail_edit_buf.is_empty() {
+                                            "—"
                                         } else {
-                                            Some(self.detail_edit_buf.clone())
+                                            &self.detail_edit_buf
                                         };
-                                        commit_item = Some(di.clone());
-                                        self.detail_edit_field = None;
+                                        egui::ComboBox::from_id_salt(&feature.id)
+                                            .selected_text(selected_text)
+                                            .show_ui(ui, |ui| {
+                                                if !feature.required
+                                                    && ui
+                                                        .selectable_value(
+                                                            &mut self.detail_edit_buf,
+                                                            String::new(),
+                                                            "—",
+                                                        )
+                                                        .clicked()
+                                                {
+                                                    commit = true;
+                                                }
+                                                for opt in options {
+                                                    if ui
+                                                        .selectable_value(
+                                                            &mut self.detail_edit_buf,
+                                                            opt.to_owned(),
+                                                            opt,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        commit = true;
+                                                    }
+                                                }
+                                            });
+                                    }
+                                    artifacts::UiTypeDef::Unit { options, .. } => {
+                                        ui.horizontal(|ui| {
+                                            let r = ui.add(
+                                                egui::TextEdit::singleline(
+                                                    &mut self.detail_edit_buf,
+                                                )
+                                                .desired_width(100.0),
+                                            );
+                                            r.request_focus();
+                                            if r.lost_focus()
+                                                || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                            {
+                                                commit = true;
+                                            }
+                                            let selected_unit = if self.detail_edit_unit.is_empty()
+                                            {
+                                                "—"
+                                            } else {
+                                                &self.detail_edit_unit
+                                            };
+                                            egui::ComboBox::from_id_salt(format!(
+                                                "{}_unit",
+                                                feature.id
+                                            ))
+                                            .selected_text(selected_unit)
+                                            .show_ui(
+                                                ui,
+                                                |ui| {
+                                                    if ui
+                                                        .selectable_value(
+                                                            &mut self.detail_edit_unit,
+                                                            String::new(),
+                                                            "—",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        commit = true;
+                                                    }
+                                                    for opt in options {
+                                                        if ui
+                                                            .selectable_value(
+                                                                &mut self.detail_edit_unit,
+                                                                opt.to_owned(),
+                                                                opt,
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            commit = true;
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    }
+                                    artifacts::UiTypeDef::Text => {
+                                        let r = ui.add(
+                                            egui::TextEdit::singleline(&mut self.detail_edit_buf)
+                                                .desired_width(f32::INFINITY),
+                                        );
+                                        r.request_focus();
+                                        if r.lost_focus()
+                                            || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                        {
+                                            commit = true;
+                                        }
                                     }
                                 }
-                                if let Some(item) = commit_item {
-                                    self.save_artifact_edit(&item);
-                                    self.sync_artifact_to_list(
-                                        item.id,
-                                        item.title,
-                                        item.dimensions,
-                                    );
+
+                                if commit {
+                                    let val_to_insert = match &feature.ui_type {
+                                        artifacts::UiTypeDef::Unit { .. } => format!(
+                                            "{}{}",
+                                            self.detail_edit_buf, self.detail_edit_unit
+                                        ),
+                                        _ => self.detail_edit_buf.clone(),
+                                    };
+                                    di.model.fields.insert(feature.id.clone(), val_to_insert);
+                                    commit_item = Some(di.clone());
+                                    self.detail_edit_field = None;
                                 }
+
+                                if let Some(committed) = commit_item {
+                                    self.save_artifact_edit(&committed);
+                                    self.sync_artifact_to_list(committed.model.clone());
+                                    self.detail_item = Some(committed);
+                                }
+
+                                ui.label("");
                             } else {
-                                ui.label(item.dimensions.as_deref().unwrap_or("—"));
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new(egui_phosphor::regular::PEN)
-                                                .size(14.0),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    self.detail_edit_buf =
-                                        item.dimensions.clone().unwrap_or_default();
-                                    self.detail_edit_field = Some(DetailEditField::Dimensions);
+                                let val = item.model.get_field(&feature.id);
+                                ui.label(if val.is_empty() { "—" } else { &val });
+
+                                if ui.button(egui_phosphor::regular::PEN).clicked() {
+                                    new_edit_field = Some(DetailEditField {
+                                        id: feature.id.to_string(),
+                                    });
+                                    match &feature.ui_type {
+                                        artifacts::UiTypeDef::Unit { options, .. } => {
+                                            let (v, u) = artifacts::split_unit(&val, options);
+                                            next_edit_buf = v;
+                                            next_edit_unit = u;
+                                        }
+                                        _ => {
+                                            next_edit_buf = val;
+                                            next_edit_unit = String::new();
+                                        }
+                                    }
                                 }
                             }
                             ui.end_row();
-                        });
-                });
+                        }
 
+                        if let Some(next) = new_edit_field {
+                            self.detail_edit_field = Some(next);
+                            self.detail_edit_buf = next_edit_buf;
+                            self.detail_edit_unit = next_edit_unit;
+                        }
+                    });
+            });
             if !open {
                 self.detail_item = None;
                 self.detail_edit_field = None;
             }
         }
 
-        // Search window, opened with Ctrl+F.
-        // Now more efficient than it was, still not ideal
-        // FIXME: Known issue: The UI will blink when the search query changes,
-        // I found fixing this exceedingly difficult, and gave up.
+        // Search window (Ctrl+F)
+        // FIXME: Known issue - the list blinks when the search query changes.
         if self.search_open {
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.search_open = false;
-            }
-
-            let mut open = true;
             let mut search_changed = false;
-            egui::Window::new("Search")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .default_pos([20.0, 40.0])
-                .show(ctx, |ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text("Search by title...")
-                            .desired_width(220.0),
-                    );
-                    response.request_focus(); // this saves a click to focus the search box
-                    if response.changed() {
-                        search_changed = true;
-                    }
-                });
-            if !open {
-                self.search_open = false;
-            }
-
+            egui::Window::new("Search").show(ctx, |ui| {
+                let resp = ui
+                    .add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Search..."));
+                resp.request_focus();
+                if resp.changed() {
+                    search_changed = true;
+                }
+            });
             if search_changed {
                 if let Some(db) = &self.db {
-                    if let Some(old_task) = self.active_task.lock().unwrap().take() {
-                        old_task.abort();
-                    }
                     self.scroll = Some(make_scroll(
                         db.clone(),
                         self.rt.handle().clone(),
+                        self.archive_name.clone(),
                         self.search_query.clone(),
+                        self.schema.clone(),
                         self.active_task.clone(),
                     ));
                 }
@@ -681,6 +739,8 @@ impl ArchiveManagerApp {
         }
     }
 }
+
+// eframe App impl
 
 impl eframe::App for ArchiveManagerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -689,45 +749,81 @@ impl eframe::App for ArchiveManagerApp {
         // Process any results that came in from async tasks since the last frame.
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                DbMessage::Opened(db) => {
+                DbMessage::Connected(db) => {
+                    self.db = Some(db);
+                }
+
+                DbMessage::ArchiveStatus(status) => {
+                    if status.exists {
+                        let schema_fields: std::collections::HashSet<String> =
+                            self.schema.features.iter().map(|f| f.id.clone()).collect();
+                        let db_fields: std::collections::HashSet<String> =
+                            status.property_fields.into_iter().collect();
+
+                        let missing_in_db: Vec<String> =
+                            schema_fields.difference(&db_fields).cloned().collect();
+                        let extra_in_db: Vec<String> =
+                            db_fields.difference(&schema_fields).cloned().collect();
+
+                        if !extra_in_db.is_empty() {
+                            self.migration_fields_to_remove = extra_in_db;
+                            self.migration_fields_to_add = missing_in_db;
+                            self.show_migration_confirm = true;
+                        } else if !missing_in_db.is_empty() {
+                            self.run_migration_op(missing_in_db, Vec::new(), &ctx);
+                        } else {
+                            self.open_archive_op(false, &ctx);
+                        }
+                    } else {
+                        self.show_confirm = true;
+                    }
+                }
+
+                DbMessage::Opened => {
+                    self.archive_open = true;
                     self.scroll = Some(make_scroll(
-                        db.clone(), // Note to self: this does NOT clone the entire DB, just the connection.
-                        // However, I should still try to avoid cloning things so much, because it's
-                        // a memory hog. But then again to me it seems like the easiest thing for 99%
-                        // of use cases to just clone stuff. Thanks for coming to my TED talk!
+                        self.db.clone().unwrap(),
                         self.rt.handle().clone(),
+                        self.archive_name.clone(),
                         String::new(),
+                        self.schema.clone(),
                         self.active_task.clone(),
                     ));
-                    self.db = Some(db);
-                    self.archive_just_opened = true; // true for one frame on entry, used to resize and retitle
+                    self.archive_just_opened = true;
                 }
+
                 DbMessage::Error(e) => {
                     self.error_propagator.push(e, None);
                 }
             }
         }
 
-        if self.db.is_none() {
+        if !self.archive_open {
             self.show_launcher(ui, &ctx);
         } else {
             self.show_archive(ui, &ctx);
         }
 
-        // Display any errors that occurred.
-        self.error_propagator.show(&ctx)
+        self.error_propagator.show(&ctx);
     }
 }
 
+// Entry point
+
 fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
+
     // Initialize logging. At this time, the default level is info.
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .try_init(); // "try_init" seemed cooler.
+        .try_init();
+
+    // Hard fail if the schema is invalid - there is nothing useful to do without it.
+    let schema = Schema::load("schema.toml")
+        .expect("Failed to load schema.toml! Refusing to start without a valid schema.");
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([400.0, 120.0])
-            .with_min_inner_size([300.0, 90.0])
             .with_title("Archive Manager"),
         ..Default::default()
     };
@@ -739,15 +835,12 @@ fn main() -> anyhow::Result<()> {
         Box::new(|cc| {
             let mut fonts = egui::FontDefinitions::default();
             egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-            // Should patch egui phoshpor to have other variants I guess, but haven't gotten around to it.
             cc.egui_ctx.set_fonts(fonts);
-
-            Ok(Box::new(ArchiveManagerApp::new()))
+            Ok(Box::new(ArchiveManagerApp::new(schema)))
         }),
     )?;
 
-    Ok(()) // Lesson learned: whatever a function returns it does not have a semicolon for some reason.
-    // I do not like it.
+    Ok(())
 }
 
 /* You may ask: "Why build a custom schema? Why not use CIDOC CRM?"
@@ -773,3 +866,8 @@ write an adapter layer then. Or something like that, anyway. But for now? Screw 
 functionality and a codebase that doesn't make me want to walk into the sea.
 (Also wikidata model would be cool, also kind of a graph DB though. And I am NOT touching that)
 */
+
+// Alright, update on the above:
+// I did... in fact, go for a graph DB. It was the only way to handle the graph relationships efficiently.
+// ...which in plain terms is "I thought it's too cool" and ignored the fact its hell actually.
+// But at least the Cypher queries are all hidden behind a DAL now. So it's cool hell.

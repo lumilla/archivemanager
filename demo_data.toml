@@ -1,0 +1,152 @@
+# Demo data for a freshly created archive.
+# This file is loaded via File > Import (or automatically on first open).
+# Format: each [[records]] entry is one artifact.
+# Field IDs must match those defined in schema.toml.
+# Fields not present in the schema are silently ignored on import.
+# Fields present in the schema but absent here default to empty string.
+
+[[records]]
+title = "Roman Amphora"
+dimensions = "30"
+dimensions_unit = "cm"
+material = "Ceramic"
+
+[[records]]
+title = "Bronze Age Sword"
+dimensions = "75"
+dimensions_unit = "cm"
+material = "Metal"
+
+[[records]]
+title = "Medieval Coin"
+material = "Metal"
+
+[[records]]
+title = "Viking Brooch"
+dimensions = "5"
+dimensions_unit = "cm"
+material = "Metal"
+
+[[records]]
+title = "Egyptian Amulet"
+dimensions = "4"
+dimensions_unit = "cm"
+material = "Stone"
+
+[[records]]
+title = "Greek Pottery Fragment"
+dimensions = "12"
+dimensions_unit = "cm"
+material = "Ceramic"
+
+[[records]]
+title = "Iron Age Axe Head"
+dimensions = "18"
+dimensions_unit = "cm"
+material = "Metal"
+
+[[records]]
+title = "Roman Legionary Helmet"
+dimensions = "25"
+dimensions_unit = "cm"
+material = "Metal"
+
+[[records]]
+title = "Byzantine Mosaic Tile"
+dimensions = "10"
+dimensions_unit = "cm"
+material = "Stone"
+
+[[records]]
+title = "Celtic Torc Fragment"
+dimensions = "6"
+dimensions_unit = "cm"
+material = "Metal"
+
+[[records]]
+title = "Neolithic Arrowhead"
+dimensions = "4"
+dimensions_unit = "cm"
+material = "Stone"
+
+[[records]]
+title = "Persian Silver Bowl"
+dimensions = "20"
+dimensions_unit = "cm"
+material = "Metal"
+
+[[records]]
+title = "Mayan Jade Pendant"
+dimensions = "7"
+dimensions_unit = "cm"
+material = "Stone"
+
+[[records]]
+title = "Chinese Tang Figurine"
+dimensions = "15"
+dimensions_unit = "cm"
+material = "Ceramic"
+
+[[records]]
+title = "Sumerian Clay Tablet"
+dimensions = "12"
+dimensions_unit = "cm"
+material = "Stone"
+
+[[records]]
+title = "Norse Rune Stone Fragment"
+dimensions = "30"
+dimensions_unit = "cm"
+material = "Stone"
+
+[[records]]
+title = "Etruscan Gold Earring"
+dimensions = "3"
+dimensions_unit = "cm"
+material = "Metal"
+
+[[records]]
+title = "Minoan Seal Stone"
+dimensions = "2"
+dimensions_unit = "cm"
+material = "Stone"
+
+[[records]]
+title = "Roman Glass Bottle"
+dimensions = "12"
+dimensions_unit = "cm"
+material = "Glass"
+
+[[records]]
+title = "Aztec Obsidian Blade"
+dimensions = "8"
+dimensions_unit = "cm"
+material = "Stone"
+
+[[records]]
+title = "Phoenician Glass Bead"
+dimensions = "1"
+dimensions_unit = "cm"
+material = "Glass"
+
+[[records]]
+title = "Mesopotamian Cylinder Seal"
+dimensions = "4"
+dimensions_unit = "cm"
+material = "Stone"
+
+[[records]]
+title = "Incan Quipu Fragment"
+material = "Fabric"
+
+[[records]]
+title = "Ottoman Calligraphy Scroll"
+dimensions = "45"
+dimensions_unit = "cm"
+material = "Fabric"
+
+[[records]]
+title = "Ming Dynasty Porcelain Shard"
+dimensions = "5"
+dimensions_unit = "cm"
+material = "Ceramic"
